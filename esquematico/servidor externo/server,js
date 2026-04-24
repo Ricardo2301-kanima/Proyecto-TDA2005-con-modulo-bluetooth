@@ -1,0 +1,628 @@
+'use strict';
+
+const express    = require('express');
+const { spawn }  = require('child_process');
+const path       = require('path');
+const cors       = require('cors');
+
+const app  = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+
+const CFG = {
+  // Pre-buffer: bytes que se acumulan antes de emitir al primer cliente
+  // 128 kbps / 8 bits = 16 KB/s → 3 s ≈ 48 KB
+  PREBUFFER_BYTES:  48 * 1024,
+
+  // Ring-buffer: últimos N chunks guardados para nuevos clientes
+  RING_SIZE:        40,
+
+  // Watchdog: si ffmpeg no produce bytes en este tiempo → reinicio
+  STALL_TIMEOUT_MS: 14_000,
+
+  // Pausa entre tracks (ms)
+  TRACK_GAP_MS:     600,
+
+  // Python: 'py' en Windows (launcher oficial), 'python3' en Linux/Mac
+  PYTHON: process.platform === 'win32' ? 'py' : 'python3',
+
+  // Cadena de formatos intentados en orden.
+  // Sin selectores [ext=...] — evitan falsos "format not available"
+  // cuando YouTube limita la lista por detección parcial de bot.
+  FORMAT_CHAIN: [
+    'bestaudio/best',   // preferir audio puro; si no, mejor vídeo+audio
+    'best',             // cualquier cosa disponible
+    'worst',            // último recurso
+  ],
+
+  YTDLP_BYPASS: [
+    '--extractor-args',    'youtube:player_client=android',
+    '--no-check-formats',
+    '--extractor-retries', '5',
+    '--no-check-certificates',
+    '--force-ipv4',
+    '--socket-timeout',    '20',
+  ],
+};
+
+
+const state = {
+  // Cola y reproducción
+  queue:           [],
+  currentItem:     null,
+  isPlaying:       false,
+  isPaused:        false,
+
+  // Procesos activos
+  ytdlpProc:       null,
+  ffmpegProc:      null,
+
+  // Clientes HTTP
+  clients:         [],
+  clientSeq:       0,
+  peakClients:     0,
+
+  // Pre-buffer: rellena antes de emitir al primer cliente
+  prebuf:          Buffer.alloc(0),
+  prebufDone:      false,
+
+  // Ring-buffer: chunks recientes para nuevos clientes
+  ring:            [],
+
+  // Watchdog
+  watchdogTimer:   null,
+  watchdogRestarts: 0,
+  lastDataAt:      null,
+
+  // Métricas del track actual
+  decodedBytes:    0,
+  decodedChunks:   0,
+  broadcastBytes:  0,
+  broadcastSent:   0,
+  currentFormat:   '?',
+  formatRetry:     0,
+  playStartAt:     null,
+  prefetchedTitle: null,
+
+  // Flag: evita que ffmpeg.on('close') llame playNext() durante un retry de formato
+  switchingFormat: false,
+};
+
+
+const ts  = () => new Date().toISOString().slice(11, 23);
+const log = (tag, msg) => process.stdout.write(`${ts()} [${tag.padEnd(8)}] ${msg}\n`);
+const err = (tag, msg) => process.stderr.write(`${ts()} [${tag.padEnd(8)}] ⚠ ${msg}\n`);
+
+// Status periódico impreso cada 10 s
+function printStatus() {
+  const elapsed  = state.playStartAt
+    ? ((Date.now() - state.playStartAt) / 1000).toFixed(1) + 's'
+    : '—';
+  const lastData = state.lastDataAt
+    ? ((Date.now() - state.lastDataAt) / 1000).toFixed(1) + 's ago'
+    : 'never';
+  const preBuf   = state.prebufDone
+    ? 'DONE'
+    : `${(state.prebuf.length / 1024).toFixed(0)}/${(CFG.PREBUFFER_BYTES / 1024).toFixed(0)} KB`;
+
+  log('STATUS', '─'.repeat(55));
+  log('STATUS', `  Track    : ${state.currentItem?.title ?? '—'}`);
+  log('STATUS', `  State    : ${state.isPlaying ? 'PLAYING' : state.isPaused ? 'PAUSED' : 'IDLE'} | Elapsed: ${elapsed}`);
+  log('STATUS', `  Format   : ${state.currentFormat} | Retry: ${state.formatRetry}`);
+  log('STATUS', `  Decoding : ${(state.decodedBytes / 1024).toFixed(1)} KB from FFmpeg (${state.decodedChunks} chunks)`);
+  log('STATUS', `  Broadcast: ${(state.broadcastBytes / 1024).toFixed(1)} KB → clients (${state.broadcastSent} chunks sent)`);
+  log('STATUS', `  Clients  : ${state.clients.length} active (peak: ${state.peakClients})`);
+  log('STATUS', `  PreBuf   : ${preBuf}`);
+  log('STATUS', `  Ring     : ${state.ring.length}/${CFG.RING_SIZE} chunks`);
+  log('STATUS', `  Watchdog : restarts=${state.watchdogRestarts} | last_data=${lastData}`);
+  log('STATUS', `  Prefetch : ${state.prefetchedTitle ?? 'idle'}`);
+  log('STATUS', '─'.repeat(55));
+}
+
+
+function pushRing(chunk) {
+  state.ring.push(chunk);
+  if (state.ring.length > CFG.RING_SIZE) state.ring.shift();
+}
+
+function broadcast(chunk) {
+  // ── Fase 1: llenar pre-buffer ──────────────────────────────
+  if (!state.prebufDone) {
+    state.prebuf = Buffer.concat([state.prebuf, chunk]);
+    if (state.prebuf.length < CFG.PREBUFFER_BYTES) return; // esperando...
+
+    // Pre-buffer listo → volcar todo de golpe
+    log('PREBUF', `✓ Completo (${(state.prebuf.length / 1024).toFixed(1)} KB) — iniciando broadcast`);
+    state.prebufDone = true;
+    chunk = state.prebuf;
+    state.prebuf = Buffer.alloc(0);
+  }
+
+  // ── Fase 2: ring-buffer (para nuevos clientes) ─────────────
+  pushRing(chunk);
+
+  // ── Fase 3: emitir a clientes activos ──────────────────────
+  if (state.clients.length === 0) return;
+
+  const dead = [];
+  for (const client of state.clients) {
+    try {
+      client.res.write(chunk);
+      state.broadcastBytes += chunk.length;
+      state.broadcastSent++;
+    } catch (_) {
+      dead.push(client.id);
+    }
+  }
+
+  if (dead.length) {
+    state.clients = state.clients.filter(c => !dead.includes(c.id));
+    log('STREAM', `${dead.length} cliente(s) muerto(s) eliminados. Activos: ${state.clients.length}`);
+  }
+}
+
+
+
+function watchdogReset() {
+  if (state.watchdogTimer) clearTimeout(state.watchdogTimer);
+  state.lastDataAt = Date.now();
+
+  state.watchdogTimer = setTimeout(() => {
+    if (!state.isPlaying) return;
+
+    state.watchdogRestarts++;
+    err('WATCHDOG', `Sin datos por ${CFG.STALL_TIMEOUT_MS / 1000}s — reiniciando (restart #${state.watchdogRestarts})`);
+
+    // Volver el track actual al frente de la cola
+    if (state.currentItem) {
+      state.queue.unshift({
+        url:     state.currentItem.url,
+        title:   state.currentItem.title,
+        addedAt: state.currentItem.addedAt,
+      });
+    }
+    killProcesses();
+    setTimeout(playNext, 1000);
+  }, CFG.STALL_TIMEOUT_MS);
+}
+
+function watchdogClear() {
+  if (state.watchdogTimer) { clearTimeout(state.watchdogTimer); state.watchdogTimer = null; }
+}
+
+
+function killProcesses() {
+  watchdogClear();
+
+  for (const key of ['ffmpegProc', 'ytdlpProc']) {
+    if (state[key]) {
+      try { state[key].kill('SIGKILL'); } catch (_) {}
+      state[key] = null;
+    }
+  }
+
+  state.isPlaying  = false;
+  state.prebuf     = Buffer.alloc(0);
+  state.prebufDone = false;
+}
+
+async function getTitle(url) {
+  return new Promise(resolve => {
+    // py -m yt_dlp — sin shell:true — 'py' es el Python Launcher de Windows
+    // que Node.js puede encontrar sin necesitar cmd.exe
+    const proc = spawn(CFG.PYTHON, [
+      '-m', 'yt_dlp',
+      '--get-title',
+      '--no-playlist',
+      ...CFG.YTDLP_BYPASS,
+      url,
+    ], { windowsHide: true });
+
+    let title = '';
+    const timer = setTimeout(() => { try { proc.kill(); } catch (_) {} resolve(url); }, 15_000);
+
+    proc.stdout.on('data', d => { title += d.toString(); });
+    proc.on('close', () => { clearTimeout(timer); resolve(title.trim() || url); });
+    proc.on('error', () => { clearTimeout(timer); resolve(url); });
+  });
+}
+
+function prefetchNext() {
+  if (!state.queue.length) return;
+  const next = state.queue[0];
+  if (next._prefetched) return;
+
+  next._prefetched      = true;
+  state.prefetchedTitle = `resolving...`;
+
+  getTitle(next.url).then(title => {
+    next.title            = title;
+    state.prefetchedTitle = `"${title}"`;
+    log('PREFETCH', `✓ "${title}"`);
+  });
+}
+
+
+function playNext() {
+  killProcesses();
+
+  if (!state.queue.length) {
+    log('QUEUE', 'Vacía — esperando nuevos tracks');
+    state.currentItem = null;
+    return;
+  }
+
+  const item = state.queue.shift();
+  Object.assign(state, {
+    currentItem:     { ...item, startedAt: new Date().toISOString() },
+    isPaused:        false,
+    isPlaying:       true,
+    decodedBytes:    0,
+    decodedChunks:   0,
+    broadcastBytes:  0,
+    broadcastSent:   0,
+    formatRetry:     0,
+    currentFormat:   '?',
+    playStartAt:     Date.now(),
+    ring:            [],    // limpiar ring al cambiar de track
+    prebuf:          Buffer.alloc(0),
+    prebufDone:      false,
+    switchingFormat: false, // reset del flag de race condition
+  });
+
+  log('PLAY', `▶ "${item.title}"`);
+  log('PLAY', `  URL   : ${item.url}`);
+  log('PLAY', `  Queue : ${state.queue.length} restantes`);
+
+  prefetchNext();
+  tryFormat(item, 0);
+}
+
+// Intentar un formato; si falla, avanza al siguiente en la cadena
+function tryFormat(item, fmtIdx) {
+  if (fmtIdx >= CFG.FORMAT_CHAIN.length) {
+    err('PLAY', `Todos los formatos fallaron para "${item.title}" — saltando`);
+    state.isPlaying = false;
+    setTimeout(playNext, CFG.TRACK_GAP_MS);
+    return;
+  }
+
+  const format = CFG.FORMAT_CHAIN[fmtIdx];
+  state.currentFormat = format;
+  state.formatRetry   = fmtIdx;
+
+  log('YTDLP', `Intentando formato [${fmtIdx + 1}/${CFG.FORMAT_CHAIN.length}]: ${format}`);
+
+  const ytdlp = spawn(CFG.PYTHON, [
+    '-m', 'yt_dlp',
+    '-f', format,
+    '--no-playlist',
+    '-o', '-',          // stdout (pipe)
+    '--quiet',
+    '--no-warnings',
+    ...CFG.YTDLP_BYPASS,
+    item.url,
+  ], { windowsHide: true });
+
+
+  const ffmpeg = spawn('ffmpeg', [
+    '-hide_banner',
+    '-loglevel', 'warning',
+    '-i',        'pipe:0',      // leer desde stdin
+    '-vn',                      // descartar vídeo
+    '-acodec',   'libmp3lame',
+    '-ab',       '128k',
+    '-ar',       '44100',
+    '-ac',       '2',
+    '-write_xing', '0',         // sin header Xing (mejor para streaming)
+    '-f',        'mp3',
+    'pipe:1',                   // stdout
+  ], { windowsHide: true });
+
+  state.ytdlpProc  = ytdlp;
+  state.ffmpegProc = ffmpeg;
+
+  // ── PIPE: yt-dlp stdout → ffmpeg stdin ───────────────────────
+  ytdlp.stdout.pipe(ffmpeg.stdin, { end: true });
+
+  // ── yt-dlp stderr ─────────────────────────────────────────────
+  let ytdlpStderr = '';
+  ytdlp.stderr.on('data', d => {
+    const txt = d.toString();
+    ytdlpStderr += txt;
+    // Filtrar líneas de progreso y vacías
+    txt.replace(/\r/g, '\n').split('\n')
+      .map(l => l.trim())
+      .filter(l => l && !l.startsWith('[download]') && !l.startsWith('frame='))
+      .forEach(l => err('YTDLP', l));
+  });
+
+  // ── ffmpeg stdout: chunks de audio decodificado ───────────────
+  ffmpeg.stdout.on('data', chunk => {
+    state.decodedBytes  += chunk.length;
+    state.decodedChunks++;
+    state.lastDataAt     = Date.now();
+    watchdogReset();
+    broadcast(chunk);
+
+    // Log cada ~500 KB decodificados
+    if (state.decodedChunks % 120 === 0) {
+      const kb      = (state.decodedBytes / 1024).toFixed(0);
+      const bcast   = (state.broadcastBytes / 1024).toFixed(0);
+      const bufState = state.prebufDone ? 'STREAMING' : `BUFFERING ${(state.prebuf.length / 1024).toFixed(0)} KB`;
+      log('DECODE', `↓ ${kb} KB decodificados | → ${bcast} KB emitidos | clients: ${state.clients.length} | ${bufState}`);
+    }
+  });
+
+  // ── ffmpeg stderr ─────────────────────────────────────────────
+  ffmpeg.stderr.on('data', d => {
+    const txt = d.toString().trim();
+    if (txt) err('FFMPEG', txt);
+  });
+
+  // ── yt-dlp errors + cierre ────────────────────────────────────
+  ytdlp.on('error', e => {
+    err('YTDLP', `Spawn error: ${e.message}`);
+    err('YTDLP', `¿Python instalado? Probando: ${CFG.PYTHON} -m yt_dlp --version`);
+  });
+
+  ytdlp.on('close', code => {
+    const kb = (state.decodedBytes / 1024).toFixed(1);
+
+    if (code === 0) {
+      log('YTDLP', `✓ Descarga completa (${kb} KB transferidos a ffmpeg)`);
+      try { ffmpeg.stdin.end(); } catch (_) {}
+      return;
+    }
+
+    err('YTDLP', `Salió con código ${code} — ${kb} KB procesados`);
+
+    // Detectar fallo de formato → intentar el siguiente
+    const isFormatError =
+      ytdlpStderr.includes('Requested format is not available') ||
+      ytdlpStderr.includes('No video formats found') ||
+      ytdlpStderr.includes('not available') ||
+      (code === 1 && state.decodedBytes === 0);
+
+    if (isFormatError && fmtIdx + 1 < CFG.FORMAT_CHAIN.length) {
+      log('YTDLP', `Formato fallido → probando siguiente (${fmtIdx + 1})`);
+      
+      // Marcar que estamos cambiando de formato ANTES de matar ffmpeg.
+      // ffmpeg.on('close') comprueba este flag y NO llama playNext().
+      state.switchingFormat = true;
+      try { ffmpeg.stdin.end(); } catch (_) {}
+      try { ffmpeg.kill('SIGKILL'); } catch (_) {}
+      state.ytdlpProc  = null;
+      state.ffmpegProc = null;
+      setTimeout(() => tryFormat(item, fmtIdx + 1), 500);
+    } else {
+      // Cerrar stdin para que ffmpeg drene y termine
+      try { ffmpeg.stdin.end(); } catch (_) {}
+    }
+  });
+
+  // ── ffmpeg errors + cierre ────────────────────────────────────
+  ffmpeg.on('error', e => {
+    err('FFMPEG', `Spawn error: ${e.message}`);
+    err('FFMPEG', `¿ffmpeg instalado? Ejecuta: ffmpeg -version`);
+  });
+
+  ffmpeg.on('close', code => {
+    watchdogClear();
+    const kb = (state.decodedBytes / 1024).toFixed(1);
+
+    if (code === 0 || state.decodedBytes > 0) {
+      log('FFMPEG', `✓ Track finalizado — ${kb} KB decodificados`);
+    } else {
+      err('FFMPEG', `Salió con código ${code} — ${kb} KB (sin datos útiles)`);
+    }
+
+    state.ffmpegProc = null;
+    state.ytdlpProc  = null;
+    state.isPlaying  = false;
+
+    // Si estamos en medio de un retry de formato, ignorar este close.
+    // tryFormat() ya lanzó el siguiente intento.
+    if (state.switchingFormat) {
+      log('FFMPEG', 'Cerrando por cambio de formato — ignorando avance de cola');
+      state.switchingFormat = false;
+      return;
+    }
+
+    if (!state.isPaused) {
+      log('QUEUE', `Avanzando en ${CFG.TRACK_GAP_MS}ms...`);
+      setTimeout(playNext, CFG.TRACK_GAP_MS);
+    }
+  });
+
+  // Log inicial
+  log('FFMPEG', `Pipeline activo: yt-dlp → pipe → ffmpeg → /stream`);
+  watchdogReset();
+
+  if (state.clients.length > 0) {
+    log('PLAY', `Transmitiendo a ${state.clients.length} cliente(s)`);
+  } else {
+    log('PLAY', 'Sin clientes — buffering en background');
+  }
+}
+
+// ESP32 se conecta aquí
+app.get('/stream', (req, res) => {
+  const id = ++state.clientSeq;
+
+  res.setHeader('Content-Type',                'audio/mpeg');
+  res.setHeader('Transfer-Encoding',           'chunked');
+  res.setHeader('Cache-Control',               'no-cache, no-store, must-revalidate');
+  res.setHeader('Connection',                  'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('X-Client-Id',                String(id));
+  res.flushHeaders();
+
+  const client = { id, res, ip: req.ip, at: Date.now() };
+  state.clients.push(client);
+  if (state.clients.length > state.peakClients) state.peakClients = state.clients.length;
+
+  log('STREAM', `Cliente #${id} conectado (${req.ip}) — Total: ${state.clients.length}`);
+
+  // Enviar ring-buffer para reproducción inmediata
+  if (state.ring.length > 0) {
+    const catchup = Buffer.concat(state.ring);
+    log('STREAM', `→ Ring-buffer enviado al cliente #${id}: ${(catchup.length / 1024).toFixed(1)} KB`);
+    try { res.write(catchup); } catch (_) {}
+  }
+
+  req.on('close', () => {
+    state.clients = state.clients.filter(c => c.id !== id);
+    log('STREAM', `Cliente #${id} desconectado — Total: ${state.clients.length}`);
+  });
+});
+
+// POST /enqueue
+app.post('/enqueue', async (req, res) => {
+  const { url } = req.body;
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'url requerida' });
+  }
+
+  log('ENQUEUE', `Fetching title: ${url}`);
+  const title = await getTitle(url);
+  const item  = { url, title, addedAt: new Date().toISOString() };
+  state.queue.push(item);
+  log('ENQUEUE', `✓ "${title}" — queue: ${state.queue.length}`);
+
+  if (!state.ffmpegProc && !state.isPaused) playNext();
+
+  return res.json({ success: true, title, queueLength: state.queue.length });
+});
+
+// POST /control
+app.post('/control', (req, res) => {
+  const { action } = req.body;
+
+  switch (action) {
+    case 'skip':
+      log('CTRL', 'Skip ⏭');
+      killProcesses();
+      state.currentItem = null;
+      setTimeout(playNext, 300);
+      break;
+
+    case 'stop':
+      log('CTRL', 'Stop ■');
+      killProcesses();
+      state.queue       = [];
+      state.currentItem = null;
+      state.isPaused    = false;
+      break;
+
+    case 'pause':
+      if (!state.ffmpegProc || state.isPaused) break;
+      log('CTRL', 'Pause ⏸');
+      if (state.currentItem) {
+        state.queue.unshift({ url: state.currentItem.url, title: state.currentItem.title, addedAt: state.currentItem.addedAt });
+      }
+      killProcesses();
+      state.isPaused = true;
+      break;
+
+    case 'resume':
+      if (!state.isPaused) break;
+      log('CTRL', 'Resume ▶');
+      state.isPaused = false;
+      playNext();
+      break;
+
+    default:
+      return res.status(400).json({ error: `Acción desconocida: ${action}` });
+  }
+
+  return res.json({ success: true, action, state: getPublicState() });
+});
+
+// GET /status
+app.get('/status', (_req, res) => res.json(getPublicState()));
+
+function getPublicState() {
+  return {
+    isPlaying:        state.isPlaying,
+    isPaused:         state.isPaused,
+    currentItem:      state.currentItem,
+    queue:            state.queue.map(({ url, title }) => ({ url, title })),
+    connectedClients: state.clients.length,
+    timestamp:        new Date().toISOString(),
+  };
+}
+
+function checkTool(cmd, args) {
+  return new Promise(resolve => {
+    const p = spawn(cmd, args, { windowsHide: true });
+    let out = '';
+    p.stdout.on('data', d => { out += d.toString(); });
+    p.stderr.on('data', d => { out += d.toString(); });
+    p.on('close',  code => resolve({ ok: code === 0, ver: out.split('\n')[0].trim() }));
+    p.on('error',  ()   => resolve({ ok: false, ver: 'NOT FOUND' }));
+  });
+}
+
+async function runDiagnostics() {
+  log('DIAG', 'Verificando herramientas requeridas...');
+
+  const [ytdlp, ffmpeg] = await Promise.all([
+    checkTool(CFG.PYTHON, ['-m', 'yt_dlp', '--version']),
+    checkTool('ffmpeg', ['-version']),
+  ]);
+
+  log('DIAG', `${ytdlp.ok  ? '✓' : '✗'}  ${CFG.PYTHON} -m yt_dlp → ${ytdlp.ver}`);
+  log('DIAG', `${ffmpeg.ok ? '✓' : '✗'}  ffmpeg              → ${ffmpeg.ver}`);
+
+  if (!ytdlp.ok || !ffmpeg.ok) {
+    err('DIAG', '');
+    err('DIAG', '╔══════════════════════════════════════════════════════════════╗');
+    err('DIAG', '║  SETUP ERROR — Faltan herramientas requeridas                ║');
+    err('DIAG', '╠══════════════════════════════════════════════════════════════╣');
+    if (!ytdlp.ok) {
+      err('DIAG', `║  yt-dlp no encontrado vía "${CFG.PYTHON} -m yt_dlp"              ║`);
+      err('DIAG', '║    Windows: pip install -U yt-dlp  (con Python del PATH)     ║');
+      err('DIAG', '║    Linux:   pip3 install -U yt-dlp                           ║');
+    }
+    if (!ffmpeg.ok) {
+      err('DIAG', '║  ffmpeg no encontrado en PATH                                ║');
+      err('DIAG', '║    Windows: https://ffmpeg.org/download.html                 ║');
+      err('DIAG', '║             Agregar C:\\ffmpeg\\bin al PATH del sistema         ║');
+      err('DIAG', '║    Linux:   sudo apt install ffmpeg                          ║');
+    }
+    err('DIAG', '╚══════════════════════════════════════════════════════════════╝');
+    process.exit(1);
+  }
+
+  log('DIAG', 'Todas las herramientas OK.\n');
+}
+
+runDiagnostics().then(() => {
+  setInterval(printStatus, 10_000);
+
+  app.listen(PORT, '0.0.0.0', () => {
+    const sep = '═'.repeat(53);
+    log('SERVER', '');
+    log('SERVER', `╔${sep}╗`);
+    log('SERVER', `║   ESP32 Audio Streaming Server v3${''.padEnd(19)}║`);
+    log('SERVER', `╠${sep}╣`);
+    log('SERVER', `║   Frontend : http://localhost:${PORT}${''.padEnd(22)}║`);
+    log('SERVER', `║   ESP32    : http://0.0.0.0:${PORT}/stream${''.padEnd(16)}║`);
+    log('SERVER', `╠${sep}╣`);
+    log('SERVER', `║   Pre-buffer: ${(CFG.PREBUFFER_BYTES / 1024).toFixed(0)} KB  (~3 s a 128 kbps)${''.padEnd(20)}║`);
+    log('SERVER', `║   Ring-buf  : ${CFG.RING_SIZE} chunks${''.padEnd(33)}║`);
+    log('SERVER', `║   Watchdog  : stall > ${CFG.STALL_TIMEOUT_MS / 1000}s → reinicio${''.padEnd(20)}║`);
+    log('SERVER', `║   Bot bypass: player_client=android,web${''.padEnd(14)}║`);
+    log('SERVER', `║   Formatos  : ${CFG.FORMAT_CHAIN.length} niveles de fallback${''.padEnd(25)}║`);
+    log('SERVER', `╚${sep}╝`);
+    log('SERVER', '');
+  });
+});
+
+process.on('SIGTERM', () => { killProcesses(); process.exit(0); });
+process.on('SIGINT',  () => { killProcesses(); process.exit(0); });
