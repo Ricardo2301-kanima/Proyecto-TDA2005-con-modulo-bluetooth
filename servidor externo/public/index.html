@@ -1,0 +1,985 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ESP32 Audio Stream — Control</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;700;900&family=Azeret+Mono:wght@300;400;500;600&display=swap" rel="stylesheet" />
+
+  <style>
+    /* ─── TOKENS ─────────────────────────────────────── */
+    :root {
+      --bg:           #070709;
+      --surface:      #0f0f15;
+      --surface-2:    #17171f;
+      --border:       #222232;
+      --border-bright:#2e2e45;
+      --accent:       #ff4d1a;
+      --accent-dim:   rgba(255, 77, 26, 0.15);
+      --accent-glow:  rgba(255, 77, 26, 0.4);
+      --amber:        #ffab40;
+      --amber-dim:    rgba(255, 171, 64, 0.12);
+      --green:        #00e5a0;
+      --green-dim:    rgba(0, 229, 160, 0.15);
+      --text:         #d8d8ee;
+      --text-2:       #7a7a9a;
+      --text-3:       #3a3a55;
+      --font-display: 'Unbounded', sans-serif;
+      --font-mono:    'Azeret Mono', monospace;
+      --radius:       4px;
+      --radius-lg:    8px;
+    }
+
+    /* ─── RESET ──────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html { font-size: 16px; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-mono);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* ─── SCANLINE OVERLAY ───────────────────────────── */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0,0,0,0.08) 2px,
+        rgba(0,0,0,0.08) 4px
+      );
+      pointer-events: none;
+      z-index: 9999;
+    }
+
+    /* ─── LAYOUT ─────────────────────────────────────── */
+    .page {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 32px 24px 80px;
+    }
+
+    /* ─── HEADER ─────────────────────────────────────── */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 40px;
+      padding-bottom: 24px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .logo-block { display: flex; align-items: baseline; gap: 12px; }
+
+    .logo-title {
+      font-family: var(--font-display);
+      font-size: 1.1rem;
+      font-weight: 900;
+      letter-spacing: -0.02em;
+      color: var(--text);
+      line-height: 1;
+    }
+
+    .logo-sub {
+      font-size: 0.6rem;
+      color: var(--text-2);
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+    }
+
+    .on-air {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.62rem;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      color: var(--text-2);
+      padding: 6px 12px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+
+    .on-air-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--text-3);
+      transition: background 0.3s;
+    }
+
+    .on-air.active .on-air-dot {
+      background: var(--accent);
+      box-shadow: 0 0 8px var(--accent-glow);
+      animation: pulse 1.4s ease-in-out infinite;
+    }
+
+    .on-air.active { color: var(--accent); border-color: var(--accent); }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.4; }
+    }
+
+    /* ─── GRID ───────────────────────────────────────── */
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    @media (max-width: 640px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+
+    /* ─── PANEL ──────────────────────────────────────── */
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 20px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .panel::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--border-bright), transparent);
+    }
+
+    .panel-label {
+      font-size: 0.55rem;
+      letter-spacing: 0.25em;
+      text-transform: uppercase;
+      color: var(--text-3);
+      margin-bottom: 16px;
+    }
+
+    .panel-full { grid-column: 1 / -1; }
+
+    /* ─── NOW PLAYING ────────────────────────────────── */
+    .now-playing {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 28px 24px;
+      margin-bottom: 16px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .now-playing::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(ellipse at 30% 50%, var(--accent-dim), transparent 70%);
+      pointer-events: none;
+    }
+
+    .np-label {
+      font-size: 0.55rem;
+      letter-spacing: 0.28em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 10px;
+    }
+
+    .np-title {
+      font-family: var(--font-display);
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: var(--text);
+      letter-spacing: -0.02em;
+      line-height: 1.3;
+      min-height: 1.4em;
+      word-break: break-word;
+    }
+
+    .np-idle {
+      color: var(--text-3);
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      font-weight: 300;
+    }
+
+    /* ─── WAVEFORM ANIMATION ─────────────────────────── */
+    .waveform {
+      display: flex;
+      align-items: center;
+      gap: 3px;
+      margin-top: 16px;
+      height: 24px;
+    }
+
+    .waveform-bar {
+      width: 3px;
+      background: var(--accent);
+      border-radius: 2px;
+      animation: wave 1.2s ease-in-out infinite;
+      opacity: 0.2;
+      height: 4px;
+      transition: opacity 0.3s;
+    }
+
+    .waveform.playing .waveform-bar { opacity: 1; height: auto; }
+
+    .waveform-bar:nth-child(1)  { animation-delay: 0s;     --h: 8px;  }
+    .waveform-bar:nth-child(2)  { animation-delay: 0.1s;   --h: 18px; }
+    .waveform-bar:nth-child(3)  { animation-delay: 0.2s;   --h: 14px; }
+    .waveform-bar:nth-child(4)  { animation-delay: 0.05s;  --h: 22px; }
+    .waveform-bar:nth-child(5)  { animation-delay: 0.15s;  --h: 10px; }
+    .waveform-bar:nth-child(6)  { animation-delay: 0.25s;  --h: 20px; }
+    .waveform-bar:nth-child(7)  { animation-delay: 0.08s;  --h: 16px; }
+    .waveform-bar:nth-child(8)  { animation-delay: 0.18s;  --h: 12px; }
+    .waveform-bar:nth-child(9)  { animation-delay: 0.3s;   --h: 24px; }
+    .waveform-bar:nth-child(10) { animation-delay: 0.12s;  --h: 8px;  }
+    .waveform-bar:nth-child(11) { animation-delay: 0.22s;  --h: 18px; }
+    .waveform-bar:nth-child(12) { animation-delay: 0.04s;  --h: 14px; }
+
+    @keyframes wave {
+      0%, 100% { height: 4px; }
+      50%       { height: var(--h, 16px); }
+    }
+
+    /* ─── STATS ROW ──────────────────────────────────── */
+    .stats-row {
+      display: flex;
+      gap: 24px;
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+    }
+
+    .stat {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .stat-val {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--amber);
+    }
+
+    .stat-key {
+      font-size: 0.52rem;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--text-3);
+    }
+
+    /* ─── INPUT ──────────────────────────────────────── */
+    .input-row {
+      display: flex;
+      gap: 8px;
+    }
+
+    .url-input {
+      flex: 1;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      padding: 10px 14px;
+      outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+
+    .url-input::placeholder { color: var(--text-3); }
+
+    .url-input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-dim);
+    }
+
+    /* ─── BUTTONS ────────────────────────────────────── */
+    .btn {
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      letter-spacing: 0.08em;
+      font-weight: 500;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px 16px;
+      cursor: pointer;
+      background: var(--surface-2);
+      color: var(--text-2);
+      transition: all 0.15s;
+      white-space: nowrap;
+    }
+
+    .btn:hover {
+      border-color: var(--border-bright);
+      color: var(--text);
+      background: var(--surface);
+    }
+
+    .btn:active { transform: scale(0.97); }
+
+    .btn-primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      font-weight: 600;
+    }
+
+    .btn-primary:hover {
+      background: #ff6a3d;
+      border-color: #ff6a3d;
+      color: #fff;
+      box-shadow: 0 0 16px var(--accent-glow);
+    }
+
+    .btn-danger {
+      border-color: rgba(255, 77, 26, 0.4);
+      color: var(--accent);
+    }
+
+    .btn-danger:hover {
+      background: var(--accent-dim);
+      border-color: var(--accent);
+    }
+
+    /* ─── CONTROLS ───────────────────────────────────── */
+    .controls-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+    }
+
+    .ctrl-btn {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      padding: 14px 8px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      cursor: pointer;
+      transition: all 0.15s;
+      font-family: var(--font-mono);
+    }
+
+    .ctrl-btn:hover {
+      border-color: var(--border-bright);
+      background: var(--surface);
+      transform: translateY(-1px);
+    }
+
+    .ctrl-btn:active { transform: scale(0.96); }
+
+    .ctrl-icon {
+      font-size: 1.3rem;
+      line-height: 1;
+    }
+
+    .ctrl-label {
+      font-size: 0.52rem;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--text-3);
+    }
+
+    .ctrl-btn.active-play {
+      border-color: var(--green);
+      background: var(--green-dim);
+    }
+
+    .ctrl-btn.active-pause {
+      border-color: var(--amber);
+      background: var(--amber-dim);
+    }
+
+    .ctrl-btn.active-play .ctrl-icon,
+    .ctrl-btn.active-play .ctrl-label { color: var(--green); }
+
+    .ctrl-btn.active-pause .ctrl-icon,
+    .ctrl-btn.active-pause .ctrl-label { color: var(--amber); }
+
+    /* ─── QUEUE ──────────────────────────────────────── */
+    .queue-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 240px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+
+    .queue-empty {
+      font-size: 0.72rem;
+      color: var(--text-3);
+      text-align: center;
+      padding: 24px 0;
+      font-style: italic;
+    }
+
+    .queue-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      animation: slideIn 0.25s ease-out;
+    }
+
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateY(-6px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .queue-num {
+      font-size: 0.62rem;
+      color: var(--text-3);
+      min-width: 18px;
+    }
+
+    .queue-title {
+      flex: 1;
+      font-size: 0.75rem;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* ─── CLIENTS ─────────────────────────────────────── */
+    .clients-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .client-indicator {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+
+    .client-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 6px var(--green);
+      animation: pulse 2s infinite;
+    }
+
+    .client-text {
+      font-size: 0.72rem;
+      color: var(--text-2);
+    }
+
+    .client-count {
+      font-family: var(--font-display);
+      font-size: 1.8rem;
+      font-weight: 900;
+      color: var(--green);
+      text-align: center;
+      padding: 8px 0;
+    }
+
+    .client-sub {
+      text-align: center;
+      font-size: 0.55rem;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--text-3);
+    }
+
+    /* ─── TOAST ──────────────────────────────────────── */
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      padding: 12px 18px;
+      background: var(--surface);
+      border: 1px solid var(--border-bright);
+      border-radius: var(--radius-lg);
+      font-size: 0.72rem;
+      color: var(--text);
+      transform: translateY(100px);
+      opacity: 0;
+      transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+      z-index: 1000;
+      max-width: 320px;
+    }
+
+    .toast.show {
+      transform: translateY(0);
+      opacity: 1;
+    }
+
+    .toast.error { border-color: var(--accent); color: var(--accent); }
+    .toast.success { border-color: var(--green); }
+
+    /* ─── LOADING ─────────────────────────────────────── */
+    .loading {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border: 1.5px solid var(--text-3);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* ─── DIVIDER ─────────────────────────────────────── */
+    .divider {
+      height: 1px;
+      background: var(--border);
+      margin: 8px 0;
+    }
+
+    /* ─── STREAM URL TIP ─────────────────────────────── */
+    .tip-bar {
+      margin-top: 24px;
+      padding: 12px 16px;
+      background: var(--amber-dim);
+      border: 1px solid rgba(255,171,64,0.25);
+      border-radius: var(--radius);
+      font-size: 0.68rem;
+      color: var(--amber);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .tip-bar span { color: var(--text-2); }
+
+    /* ─── STATUS BAR ─────────────────────────────────── */
+    .status-bar {
+      position: fixed;
+      bottom: 0; left: 0; right: 0;
+      height: 28px;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 24px;
+      gap: 24px;
+      font-size: 0.58rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-3);
+      z-index: 100;
+    }
+
+    .status-item { display: flex; align-items: center; gap: 6px; }
+    .status-dot  { width: 5px; height: 5px; border-radius: 50%; background: var(--text-3); }
+    .status-dot.ok  { background: var(--green); }
+    .status-dot.err { background: var(--accent); }
+  </style>
+</head>
+<body>
+
+<div class="page">
+
+  <!-- ── HEADER ─────────────────────────────────────── -->
+  <header class="header">
+    <div class="logo-block">
+      <div>
+        <div class="logo-title">ESP32 STREAMER</div>
+        <div class="logo-sub">Broadcast Control System</div>
+      </div>
+    </div>
+    <div class="on-air" id="onAirBadge">
+      <div class="on-air-dot"></div>
+      <span id="onAirText">IDLE</span>
+    </div>
+  </header>
+
+  <!-- ── NOW PLAYING ────────────────────────────────── -->
+  <div class="now-playing">
+    <div class="np-label">▶ Now Broadcasting</div>
+    <div class="np-title" id="npTitle">
+      <span class="np-idle">— No hay reproducción activa —</span>
+    </div>
+    <div class="waveform" id="waveform">
+      <div class="waveform-bar"></div>
+      <div class="waveform-bar"></div>
+      <div class="waveform-bar"></div>
+      <div class="waveform-bar"></div>
+      <div class="waveform-bar"></div>
+      <div class="waveform-bar"></div>
+      <div class="waveform-bar"></div>
+      <div class="waveform-bar"></div>
+      <div class="waveform-bar"></div>
+      <div class="waveform-bar"></div>
+      <div class="waveform-bar"></div>
+      <div class="waveform-bar"></div>
+    </div>
+    <div class="stats-row">
+      <div class="stat">
+        <div class="stat-val" id="statClients">0</div>
+        <div class="stat-key">Receptores</div>
+      </div>
+      <div class="stat">
+        <div class="stat-val" id="statQueue">0</div>
+        <div class="stat-key">En cola</div>
+      </div>
+      <div class="stat">
+        <div class="stat-val" id="statState">IDLE</div>
+        <div class="stat-key">Estado</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── MAIN GRID ──────────────────────────────────── -->
+  <div class="grid">
+
+    <!-- AÑADIR A COLA -->
+    <div class="panel panel-full">
+      <div class="panel-label">Añadir a la cola</div>
+      <div class="input-row">
+        <input
+          type="text"
+          class="url-input"
+          id="urlInput"
+          placeholder="https://www.youtube.com/watch?v=..."
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button class="btn btn-primary" id="enqueueBtn" onclick="enqueue()">+ Añadir</button>
+      </div>
+    </div>
+
+    <!-- CONTROLES -->
+    <div class="panel">
+      <div class="panel-label">Controles de reproducción</div>
+      <div class="controls-grid">
+        <button class="ctrl-btn" id="btnPlayPause" onclick="togglePlayPause()">
+          <span class="ctrl-icon" id="playPauseIcon">▶</span>
+          <span class="ctrl-label" id="playPauseLabel">Play</span>
+        </button>
+        <button class="ctrl-btn" onclick="control('skip')">
+          <span class="ctrl-icon">⏭</span>
+          <span class="ctrl-label">Skip</span>
+        </button>
+        <button class="ctrl-btn" onclick="control('stop')">
+          <span class="ctrl-icon">■</span>
+          <span class="ctrl-label">Stop</span>
+        </button>
+        <button class="ctrl-btn" onclick="openStream()">
+          <span class="ctrl-icon">🔊</span>
+          <span class="ctrl-label">Stream</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- CLIENTES CONECTADOS -->
+    <div class="panel">
+      <div class="panel-label">Receptores conectados</div>
+      <div class="clients-panel">
+        <div class="client-count" id="clientCount">0</div>
+        <div class="client-sub">ESP32 / Clientes HTTP</div>
+        <div class="divider"></div>
+        <div class="client-indicator" id="clientIndicator">
+          <div class="client-dot" style="background:var(--text-3);box-shadow:none"></div>
+          <span class="client-text">Sin clientes conectados</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- COLA DE REPRODUCCIÓN -->
+    <div class="panel panel-full">
+      <div class="panel-label" style="display:flex;justify-content:space-between;align-items:center">
+        <span>Cola de reproducción</span>
+        <span id="queueCount" style="color:var(--text-3);font-size:0.6rem">0 tracks</span>
+      </div>
+      <div class="queue-list" id="queueList">
+        <div class="queue-empty">La cola está vacía. Añade una URL de YouTube.</div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- TIP -->
+  <div class="tip-bar">
+    <span style="color:var(--amber)">ESP32 Stream URL →</span>
+    <span id="streamUrl">http://TU_SERVIDOR:3000/stream</span>
+  </div>
+
+</div>
+
+<!-- STATUS BAR -->
+<div class="status-bar">
+  <div class="status-item">
+    <div class="status-dot" id="connDot"></div>
+    <span id="connLabel">Desconectado</span>
+  </div>
+  <div class="status-item">
+    <span>v1.0.0</span>
+  </div>
+  <div class="status-item">
+    <span id="lastUpdate">—</span>
+  </div>
+</div>
+
+<!-- TOAST -->
+<div class="toast" id="toast"></div>
+
+<!-- ─────────────────────────────────────────── -->
+<!-- JAVASCRIPT                                  -->
+<!-- ─────────────────────────────────────────── -->
+<script>
+  // ── CONFIG ────────────────────────────────────────
+  // El backend y el frontend están en el mismo servidor,
+  // así que usamos window.location.origin como base.
+  const API = window.location.origin;
+  const POLL_INTERVAL = 2000; // ms
+
+  // ── STATE ─────────────────────────────────────────
+  let state = {
+    isPlaying: false,
+    isPaused: false,
+    currentItem: null,
+    queue: [],
+    connectedClients: 0
+  };
+
+  // ── DOM REFS ──────────────────────────────────────
+  const $npTitle       = document.getElementById('npTitle');
+  const $waveform      = document.getElementById('waveform');
+  const $onAirBadge    = document.getElementById('onAirBadge');
+  const $onAirText     = document.getElementById('onAirText');
+  const $statClients   = document.getElementById('statClients');
+  const $statQueue     = document.getElementById('statQueue');
+  const $statState     = document.getElementById('statState');
+  const $queueList     = document.getElementById('queueList');
+  const $queueCount    = document.getElementById('queueCount');
+  const $clientCount   = document.getElementById('clientCount');
+  const $clientIndicator = document.getElementById('clientIndicator');
+  const $btnPlayPause  = document.getElementById('btnPlayPause');
+  const $playPauseIcon = document.getElementById('playPauseIcon');
+  const $playPauseLabel = document.getElementById('playPauseLabel');
+  const $urlInput      = document.getElementById('urlInput');
+  const $enqueueBtn    = document.getElementById('enqueueBtn');
+  const $connDot       = document.getElementById('connDot');
+  const $connLabel     = document.getElementById('connLabel');
+  const $lastUpdate    = document.getElementById('lastUpdate');
+  const $toast         = document.getElementById('toast');
+  const $streamUrl     = document.getElementById('streamUrl');
+
+  // Set stream URL hint
+  $streamUrl.textContent = `${API}/stream`;
+
+  // ── TOAST ─────────────────────────────────────────
+  let toastTimer;
+  function showToast(msg, type = 'default') {
+    clearTimeout(toastTimer);
+    $toast.textContent = msg;
+    $toast.className   = `toast ${type} show`;
+    toastTimer = setTimeout(() => { $toast.className = 'toast'; }, 3500);
+  }
+
+  // ── ENQUEUE ───────────────────────────────────────
+  async function enqueue() {
+    const url = $urlInput.value.trim();
+    if (!url) { showToast('Introduce una URL de YouTube', 'error'); return; }
+
+    $enqueueBtn.disabled = true;
+    $enqueueBtn.innerHTML = '<span class="loading"></span>Añadiendo…';
+
+    try {
+      const res  = await fetch(`${API}/enqueue`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ url })
+      });
+      const data = await res.json();
+
+      if (data.error) throw new Error(data.error);
+
+      showToast(`✓ "${data.title}" añadido`, 'success');
+      $urlInput.value = '';
+      await poll();
+    } catch (e) {
+      showToast(`Error: ${e.message}`, 'error');
+    } finally {
+      $enqueueBtn.disabled = false;
+      $enqueueBtn.textContent = '+ Añadir';
+    }
+  }
+
+  // ── CONTROL ───────────────────────────────────────
+  async function control(action) {
+    try {
+      const res  = await fetch(`${API}/control`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ action })
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      await poll();
+    } catch (e) {
+      showToast(`Error: ${e.message}`, 'error');
+    }
+  }
+
+  function togglePlayPause() {
+    if (state.isPlaying)  control('pause');
+    else if (state.isPaused) control('resume');
+    else control('resume');
+  }
+
+  function openStream() {
+    window.open(`${API}/stream`, '_blank');
+  }
+
+  // ── RENDER ────────────────────────────────────────
+  function render(s) {
+    state = s;
+
+    // Now playing
+    if (s.currentItem) {
+      $npTitle.textContent = s.currentItem.title || s.currentItem.url;
+    } else {
+      $npTitle.innerHTML = '<span class="np-idle">— No hay reproducción activa —</span>';
+    }
+
+    // Waveform
+    if (s.isPlaying) {
+      $waveform.classList.add('playing');
+    } else {
+      $waveform.classList.remove('playing');
+    }
+
+    // ON AIR badge
+    if (s.isPlaying) {
+      $onAirBadge.classList.add('active');
+      $onAirText.textContent = 'ON AIR';
+    } else {
+      $onAirBadge.classList.remove('active');
+      $onAirText.textContent = s.isPaused ? 'PAUSED' : 'IDLE';
+    }
+
+    // Stats
+    $statClients.textContent = s.connectedClients;
+    $statQueue.textContent   = s.queue.length;
+    $statState.textContent   = s.isPlaying ? 'PLAYING' : s.isPaused ? 'PAUSED' : 'IDLE';
+
+    // Play/Pause button
+    if (s.isPlaying) {
+      $btnPlayPause.className   = 'ctrl-btn active-play';
+      $playPauseIcon.textContent = '⏸';
+      $playPauseLabel.textContent = 'Pause';
+    } else if (s.isPaused) {
+      $btnPlayPause.className   = 'ctrl-btn active-pause';
+      $playPauseIcon.textContent = '▶';
+      $playPauseLabel.textContent = 'Resume';
+    } else {
+      $btnPlayPause.className   = 'ctrl-btn';
+      $playPauseIcon.textContent = '▶';
+      $playPauseLabel.textContent = 'Play';
+    }
+
+    // Client indicator
+    $clientCount.textContent = s.connectedClients;
+    if (s.connectedClients > 0) {
+      $clientIndicator.innerHTML = `
+        <div class="client-dot"></div>
+        <span class="client-text">${s.connectedClients} cliente${s.connectedClients > 1 ? 's' : ''} conectado${s.connectedClients > 1 ? 's' : ''}</span>
+      `;
+    } else {
+      $clientIndicator.innerHTML = `
+        <div class="client-dot" style="background:var(--text-3);box-shadow:none"></div>
+        <span class="client-text">Sin clientes conectados</span>
+      `;
+    }
+
+    // Queue
+    $queueCount.textContent = `${s.queue.length} track${s.queue.length !== 1 ? 's' : ''}`;
+
+    if (s.queue.length === 0) {
+      $queueList.innerHTML = '<div class="queue-empty">La cola está vacía. Añade una URL de YouTube.</div>';
+    } else {
+      $queueList.innerHTML = s.queue.map((item, i) => `
+        <div class="queue-item">
+          <span class="queue-num">${String(i + 1).padStart(2, '0')}</span>
+          <span class="queue-title">${escHtml(item.title || item.url)}</span>
+        </div>
+      `).join('');
+    }
+
+    // Last update
+    $lastUpdate.textContent = `Actualizado: ${new Date().toLocaleTimeString('es', { hour12: false })}`;
+  }
+
+  function escHtml(str) {
+    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  // ── POLLING ───────────────────────────────────────
+  let connected = false;
+
+  async function poll() {
+    try {
+      const res  = await fetch(`${API}/status`);
+      const data = await res.json();
+      render(data);
+
+      if (!connected) {
+        connected = true;
+        $connDot.className   = 'status-dot ok';
+        $connLabel.textContent = 'Conectado';
+      }
+    } catch (_) {
+      if (connected) {
+        connected = false;
+        $connDot.className   = 'status-dot err';
+        $connLabel.textContent = 'Sin conexión con el servidor';
+      }
+    }
+  }
+
+  // ── KEYBOARD SHORTCUTS ────────────────────────────
+  document.addEventListener('keydown', e => {
+    if (document.activeElement === $urlInput) return;
+    if (e.key === ' ')       { e.preventDefault(); togglePlayPause(); }
+    if (e.key === 'ArrowRight') control('skip');
+    if (e.key === 'Escape')  control('stop');
+  });
+
+  $urlInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') enqueue();
+  });
+
+  // ── INIT ──────────────────────────────────────────
+  poll();
+  setInterval(poll, POLL_INTERVAL);
+</script>
+
+</body>
+</html>
